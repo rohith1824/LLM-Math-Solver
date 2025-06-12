@@ -1,4 +1,4 @@
-# LLM Math Solver (NumPy)
+# LLM Math Solver
 
 ## Project Overview
 
