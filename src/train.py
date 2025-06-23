@@ -1,13 +1,13 @@
 import numpy as np
 from model import MiniTransformer
 from dataset_loader import MathDataset
-
+import pickle
 
 #hyper-params
 VOCAB      =  len(MathDataset(pad_to=1).tok.tokens)  # extract vocab size
 SEQ_LEN    = 64
 BATCH_SIZE = 32
-EPOCHS     = 20
+EPOCHS     = 5
 LR         = 1e-3
 CLIP       = 1.0
 D_MODEL    = 128
@@ -151,3 +151,9 @@ for ep in range(1, EPOCHS+1):
     avg = total_loss / (ds.x_train.shape[0] / BATCH_SIZE)
 
     print(f"Epoch {ep}/{EPOCHS} | avg loss {avg:.4f}")
+    
+np.savez("model_weights.npz", *params)
+print("weights saved to model_weights.npz 🚀")
+
+with open("model.pkl","wb") as f:
+    pickle.dump(model, f)

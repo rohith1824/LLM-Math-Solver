@@ -1,4 +1,3 @@
-# src/model.py
 import numpy as np
 from typing import List
 
@@ -104,6 +103,7 @@ class FeedForward:
         self.W2_grad = np.zeros_like(self.W2)
         self.b2_grad = np.zeros_like(self.b2)
     def __call__(self, x):
+        self.x_in = x
         self.h = np.maximum(0, x @ self.W1 + self.b1)
         return self.h @ self.W2 + self.b2
 
@@ -115,8 +115,8 @@ class Block:
         self.ln2  = LayerNorm(D)
     def __call__(self, x):
         self.x_in = x
-        x = self.ln1(x + self.attn(x))
-        x = self.ln2(x + self.ff(x))
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ff(self.ln2(x))
         return x
 
 class OutputHead:
