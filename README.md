@@ -76,4 +76,4 @@ Even though most ML work uses high-level frameworks, this project was built to:
 
 ## License
 
-MIT License – free to use, fork, and build upon.
+MIT License: free to use, fork, and build upon.
