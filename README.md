@@ -18,16 +18,15 @@ This project is a lightweight language model built from scratch in **NumPy**, de
 - Pads or truncates sequences to a fixed length
 
 ### Model Architecture
-- Token embeddings and positional encodings
-- Multi-head self-attention (single layer)
-- Feed-forward network (FFN)
-- Layer normalization
+- Token embeddings 
+- Single-head self-attention (single layer)
 - Output projection layer
+- Causal masking for autoregressive generation
 
 ### Training Loop
 - Cross-entropy loss function
 - Manual gradient updates using pure NumPy
-- Logs training and validation loss over epochs
+- Logs training loss over epochs
 
 ### Inference
 - Greedy decoding implemented in `inference.py`

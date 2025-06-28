@@ -38,4 +38,4 @@ for epoch in range(1, EPOCHS + 1):
 # Save weights & whole model
 with open("tiny_transformer.pkl", "wb") as f:
     pickle.dump(model, f)
-print("✅ Model saved to tiny_transformer.pkl")
+print(" Model saved to tiny_transformer.pkl")
