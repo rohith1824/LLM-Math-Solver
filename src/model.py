@@ -1,146 +1,128 @@
 import numpy as np
-from typing import List
 
-# Rotary helpers
-def rotary_angles(T: int, d: int):
-    inv = 1.0 / (10000 ** (np.arange(0, d, 2, dtype=np.float32) / d))
-    pos = np.arange(T, dtype=np.float32)
-    freqs = np.outer(pos, inv)
-    return np.cos(freqs), np.sin(freqs)
+DEBUG = False  # True prints gradient std every step
 
-def rope(x, cos, sin):
-    x1, x2 = x[..., 0::2], x[..., 1::2]
-    cos, sin = cos[None, :, :], sin[None, :, :]
-    out = np.empty_like(x)
-    out[..., 0::2] = x1 * cos - x2 * sin
-    out[..., 1::2] = x1 * sin + x2 * cos
-    return out
+def softmax(x, axis=-1):
+    x = x - x.max(axis=axis, keepdims=True)
+    ex = np.exp(x, dtype=np.float32)
+    return ex / ex.sum(axis=axis, keepdims=True)
 
-# Core layers
-class Embedding:
-    def __init__(self, V, D):
-        self.E = np.random.randn(V, D).astype(np.float32)*0.02
-        self.E_grad = np.zeros_like(self.E)
-    def __call__(self, ids):
-        self.last_ids = ids
-        return self.E[ids]
 
-class LayerNorm:
-    def __init__(self, D, eps=1e-5):
-        self.gamma = np.ones(D, dtype=np.float32)
-        self.beta  = np.zeros(D, dtype=np.float32)
-        self.gamma_grad = np.zeros_like(self.gamma)
-        self.beta_grad  = np.zeros_like(self.beta)
-        self.eps = eps
-    def __call__(self, x):
-        self.x    = x
-        self.mu   = x.mean(-1, keepdims=True)
-        self.var  = x.var(-1, keepdims=True)
-        self.inv  = 1.0/np.sqrt(self.var + self.eps)
-        self.xhat = (x - self.mu)*self.inv
-        self.y    = self.gamma*self.xhat + self.beta
-        return self.y
+class TinyTransformer:
+    """single-layer, single-head causal self-attention in pure NumPy"""
 
-class MHSA:
-    def __init__(self, D, h=2):
-        assert D % h == 0
-        self.D, self.h, self.dh = D, h, D//h
-        self.Wq = np.random.randn(D,D).astype(np.float32)*0.02
-        self.Wk = np.random.randn(D,D).astype(np.float32)*0.02
-        self.Wv = np.random.randn(D,D).astype(np.float32)*0.02
-        self.Wo = np.random.randn(D,D).astype(np.float32)*0.02
-        self.Wq_grad = np.zeros_like(self.Wq)
-        self.Wk_grad = np.zeros_like(self.Wk)
-        self.Wv_grad = np.zeros_like(self.Wv)
-        self.Wo_grad = np.zeros_like(self.Wo)
-        self.cache = None
+    def __init__(self, vocab_size: int, ctx_len: int, d_model: int = 64, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        self.V, self.T, self.D = vocab_size, ctx_len, d_model
 
-    @staticmethod
-    def _mask(T):
-        return np.triu(np.ones((T,T),dtype=np.float32),k=1)*-1e9
+        # parameters
+        self.E  = rng.standard_normal((self.V, d_model), dtype=np.float32) * 0.02
+        self.Wq = rng.standard_normal((d_model, d_model), dtype=np.float32) * 0.02
+        self.Wk = rng.standard_normal((d_model, d_model), dtype=np.float32) * 0.02
+        self.Wv = rng.standard_normal((d_model, d_model), dtype=np.float32) * 0.02
+        self.Wo = rng.standard_normal((d_model, vocab_size), dtype=np.float32) * 0.02
 
-    def __call__(self, x):
-        B,T,_ = x.shape
-        self.x_in = x                    # for Wq/Wk/Wv grads
-        self.Q = x @ self.Wq             # (B,T,D)
-        self.K = x @ self.Wk
-        self.V = x @ self.Wv
+        # grad buffers
+        self.grads = {n: np.zeros_like(p) for n, p in {
+            "E": self.E, "Wq": self.Wq, "Wk": self.Wk,
+            "Wv": self.Wv, "Wo": self.Wo}.items()}
 
-        # split to heads
-        Qh = self.Q.reshape(B,T,self.h,self.dh).transpose(0,2,1,3)  # (B,h,T,dh)
-        Kh = self.K.reshape(B,T,self.h,self.dh).transpose(0,2,1,3)
-        Vh = self.V.reshape(B,T,self.h,self.dh).transpose(0,2,1,3)
+        # causal mask and scaling
+        self.mask  = np.triu(np.ones((ctx_len, ctx_len), dtype=np.float32), k=1) * -1e9
+        self.scale = 1.0 / np.sqrt(d_model)
 
-        # cache for back-prop
-        self.Qh, self.Kh, self.Vh = Qh, Kh, Vh
+    # forward
+    def forward(self, ids: np.ndarray) -> np.ndarray:
+        """ids: (B, T) int32  ->  logits: (B, T, V)"""
+        self.ids = ids
+        B, T = ids.shape
 
-        # rotary
-        if self.cache is None or self.cache[0].shape[0] < T:
-            self.cache = rotary_angles(T, self.dh)
-        cos,sin = self.cache
-        Qh = rope(Qh, cos[:T], sin[:T])
-        Kh = rope(Kh, cos[:T], sin[:T])
+        self.X  = self.E[ids]              # (B,T,D)
+        self.Q  = self.X @ self.Wq
+        self.K  = self.X @ self.Wk
+        self.Vv = self.X @ self.Wv
 
-        # attention
-        S = (Qh @ Kh.transpose(0,1,3,2)) / np.sqrt(self.dh)
-        S = S + self._mask(T)
-        expS = np.exp(S - S.max(-1,keepdims=True))
-        self.att = expS/expS.sum(-1,keepdims=True)               # (B,h,T,T)
+        att = (self.Q @ self.K.transpose(0, 2, 1)) * self.scale
+        att += self.mask[:T, :T]
+        self.att_w = softmax(att, axis=-1)         # (B,T,T)
 
-        heads = self.att @ Vh                                     # (B,h,T,dh)
-        concat = heads.transpose(0,2,1,3).reshape(B,T,self.D)     # (B,T,D)
-        self.O_in = concat                                        # cache
-        return concat @ self.Wo                                   # (B,T,D)
+        self.context = self.att_w @ self.Vv        # (B,T,D)
+        logits = self.context @ self.Wo            # (B,T,V)
+        return logits
 
-class FeedForward:
-    def __init__(self, D, Dff):
-        self.W1 = np.random.randn(D,Dff).astype(np.float32)*0.02
-        self.b1 = np.zeros(Dff, dtype=np.float32)
-        self.W2 = np.random.randn(Dff,D).astype(np.float32)*0.02
-        self.b2 = np.zeros(D, dtype=np.float32)
-        self.W1_grad = np.zeros_like(self.W1)
-        self.b1_grad = np.zeros_like(self.b1)
-        self.W2_grad = np.zeros_like(self.W2)
-        self.b2_grad = np.zeros_like(self.b2)
-    def __call__(self, x):
-        self.x_in = x
-        self.h = np.maximum(0, x @ self.W1 + self.b1)
-        return self.h @ self.W2 + self.b2
+    # loss + backward
+    def loss_and_backward(self, logits: np.ndarray, labels: np.ndarray) -> float:
+        B, T, V = logits.shape
 
-class Block:
-    def __init__(self, D, Dff, h):
-        self.attn = MHSA(D,h)
-        self.ln1  = LayerNorm(D)
-        self.ff   = FeedForward(D,Dff)
-        self.ln2  = LayerNorm(D)
-    def __call__(self, x):
-        self.x_in = x
-        x = x + self.attn(self.ln1(x))
-        x = x + self.ff(self.ln2(x))
-        return x
+        probs = softmax(logits, axis=-1)
 
-class OutputHead:
-    def __init__(self, D, V):
-        self.W = np.random.randn(D,V).astype(np.float32)*0.02
-        self.b = np.zeros(V, dtype=np.float32)
-        self.W_grad = np.zeros_like(self.W)
-        self.b_grad = np.zeros_like(self.b)
-    def __call__(self, x):
-        self.x_in = x
-        L = x @ self.W + self.b
-        L = L - L.max(-1,keepdims=True)
-        E = np.exp(L)
-        return E/E.sum(-1,keepdims=True)
+        # one-hot scatter
+        onehot = np.zeros_like(probs, dtype=np.float32)
+        rows = np.repeat(np.arange(B), T)
+        cols = np.tile(np.arange(T), B)
+        onehot[rows, cols, labels.ravel()] = 1.0
 
-class MiniTransformer:
-    def __init__(self, V, T, D=128, Dff=512, L=2, H=2):
-        self.embed  = Embedding(V,D)
-        self.blocks: List[Block] = [Block(D,Dff,H) for _ in range(L)]
-        self.head   = OutputHead(D,V)
-        self.T = T
-    def forward(self, ids):
-        x = self.embed(ids)
-        for blk in self.blocks:
-            x = blk(x)
-        return self.head(x)
-    __call__ = forward
+        loss = -np.log((probs * onehot).sum(-1) + 1e-9).mean()
+
+        dlogits = (probs - onehot) / (B * T)
+        if DEBUG: print("dlogits std:", dlogits.std())
+
+        # Wo gradients
+        self.grads["Wo"][...] = self.context.reshape(-1, self.D).T @ dlogits.reshape(-1, V)
+        dcontext = dlogits @ self.Wo.T                        # (B,T,D)
+
+        # Backprop through attention
+        datt = dcontext @ self.Vv.transpose(0, 2, 1)          # (B,T,T)
+        dVv = self.att_w.transpose(0, 2, 1) @ dcontext        # (B,T,D)
+
+        # softmax backprop
+        dS = self.att_w * (datt - (datt * self.att_w).sum(-1, keepdims=True))
+        dS = dS * self.scale
+
+        dQ = dS @ self.K
+        dK = dS.transpose(0, 2, 1) @ self.Q
+
+        # Parameter grads
+        self.grads["Wq"][...] = self.X.reshape(-1, self.D).T @ dQ.reshape(-1, self.D)
+        self.grads["Wk"][...] = self.X.reshape(-1, self.D).T @ dK.reshape(-1, self.D)
+        self.grads["Wv"][...] = self.X.reshape(-1, self.D).T @ dVv.reshape(-1, self.D)
+
+        # dX accumulates contributions
+        dX = (dQ @ self.Wq.T) + (dK @ self.Wk.T) + (dVv @ self.Wv.T)
+
+        # Embedding grads
+        gradE = np.zeros_like(self.E)
+        idx = self.ids.ravel()
+        np.add.at(gradE, idx, dX.reshape(-1, self.D))
+        self.grads["E"][...] = gradE
+
+        return loss
+    
+    # SGD update
+    def step(self, lr: float = 1e-3, clip: float = 1.0):
+        for name, param in [("E", self.E), ("Wq", self.Wq), ("Wk", self.Wk),
+                            ("Wv", self.Wv), ("Wo", self.Wo)]:
+            g = self.grads[name]
+            np.clip(g, -clip, clip, out=g)
+            if DEBUG: print(f"∇{name} std:", g.std())
+            param -= lr * g
+            g.fill(0.0)
+
+
+# test
+if __name__ == "__main__":
+    tok_ids = {"2": 26, "+": 8, "=": 11, "4": 28}
+    seq_in  = np.array([[tok_ids["2"], tok_ids["+"], tok_ids["2"], tok_ids["="]]], dtype=np.int32)
+    seq_lab = np.array([[tok_ids["+"], tok_ids["2"], tok_ids["="], tok_ids["4"]]], dtype=np.int32)
+
+    model = TinyTransformer(vocab_size=64, ctx_len=4, d_model=32)
+    for step in range(601):
+        logits = model.forward(seq_in)
+        loss   = model.loss_and_backward(logits, seq_lab)
+        model.step(lr=1e-3)
+        if step % 100 == 0:
+            print(f"step {step:4d} | loss {loss:.4f}")
+
+    #next token
+    nxt = model.forward(seq_in)[0, -1].argmax()
+    print("predicted next-id:", nxt, "(should be 28 for '4')")

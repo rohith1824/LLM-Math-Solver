@@ -1,63 +1,54 @@
+"""
+Generates a lightweight datset of arithmetic Q→A pairs for the llm to train on.
+"""
+
 import argparse
-import pathlib
-import re
+import random
+from pathlib import Path
 
-from datasets import load_dataset, disable_progress_bar
-from tqdm import tqdm
+# helpers
+OPERATORS = [
+    ("+", lambda a, b: a + b),
+    ("-", lambda a, b: a - b),
+    ("*", lambda a, b: a * b),
+]
 
-def _clean(text: str) -> str:
-    return re.sub(r"\s+", " ", text.strip())
+QUESTION_STYLES = [
+    lambda a, op, b, ans: f"{a}{op}{b}={ans}",
+    lambda a, op, b, ans: f"What is {a} {op} {b}? {ans}",
+]
 
-def build_dataset(
-    modules: list[str],
-    per_module: int,
-    out_path: pathlib.Path,
-    seed: int,
-):
-    disable_progress_bar()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    total = per_module * len(modules)
 
-    with out_path.open("w", encoding="utf-8") as f:
-        for mod in modules:
-            print(f"▶ sampling {per_module:,} examples from {mod}")
-            # stream so you don’t download 2GB
-            ds = load_dataset("deepmind/math_dataset", mod, split="train", streaming=True)
-            it = ds.shuffle(buffer_size=10_000, seed=seed).__iter__()
-            for _ in tqdm(range(per_module), desc=mod):
-                ex = next(it)
-                q = _clean(ex["question"])
-                a = _clean(ex["answer"])
-                f.write(f"{q}\t{a}\n")
+def make_example(rng: random.Random) -> str:
+    """Generate a single math Q→A line."""
+    op_sym, fn = rng.choice(OPERATORS)
 
-    print(f"✅ wrote {total:,} Q-A pairs → {out_path.resolve()}")
+    a = rng.randint(0, 99)
+    b = rng.randint(0, 99)
 
-def _parse_args():
-    p = argparse.ArgumentParser(__doc__)
-    p.add_argument(
-        "--modules", nargs="+",
-        default=["arithmetic__add_or_sub", "arithmetic__mul", "arithmetic__div"],
-        help="DeepMind modules to include",
-    )
-    p.add_argument(
-        "--per", type=int, default=10_000,
-        help="Examples per module",
-    )
-    p.add_argument(
-        "--out", default="data/math_dataset.txt",
-        help="Output TSV file",
-    )
-    p.add_argument(
-        "--seed", type=int, default=42,
-        help="Shuffle seed",
-    )
-    return p.parse_args()
+    # avoid negative 
+    if op_sym == "-" and a < b:
+        a, b = b, a
+
+    ans = fn(a, b)
+    style = rng.choice(QUESTION_STYLES)
+    return style(a, op_sym, b, ans)
 
 if __name__ == "__main__":
-    args = _parse_args()
-    build_dataset(
-        modules=args.modules,
-        per_module=args.per,
-        out_path=pathlib.Path(args.out),
-        seed=args.seed,
-    )
+    parser = argparse.ArgumentParser(description="Generate math QA corpus")
+    parser.add_argument("--n", type=int, default=500_000,
+                        help="number of examples to generate (default 100k)")
+    parser.add_argument("--out", type=Path, default=Path("dataset.txt"),
+                        help="output text file (one example per line)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="PRNG seed for reproducibility")
+    args = parser.parse_args()
+
+    rng = random.Random(args.seed)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+
+    with args.out.open("w", encoding="utf-8") as f:
+        for _ in range(args.n):
+            f.write(make_example(rng) + "\n")
+
+    print(f"Wrote {args.n:,} examples to {args.out}")

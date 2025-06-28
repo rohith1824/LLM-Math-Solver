@@ -1,49 +1,42 @@
-import argparse
-import pickle
-import numpy as np
+import argparse, pickle, numpy as np
 from dataset_loader import MathDataset
 
-def generate(prompt: str, model, tok, pad_to: int) -> str:
-    """
-    Encode the prompt, pad/truncate to pad_to, run one forward pass,
-    argmax over vocab at each of pad_to positions, then decode.
-    """
-    # 1) encode the prompt (adds <START> and <END>)
-    ids = tok.encode(prompt)
-    # 2) pad or truncate to exactly pad_to tokens
-    pad_id = tok.token2id[tok.pad_token]
-    if len(ids) < pad_to:
-        ids = ids + [pad_id] * (pad_to - len(ids))
-    else:
-        ids = ids[:pad_to]
-    X = np.array([ids], dtype=np.int32)     # shape (1, pad_to)
+def generate(prompt: str, model, tok):
+    ids = tok.encode(prompt.strip())              # <START> … <END>
+    pad = tok.token2id[tok.pad_token]
 
-    # 3) forward pass
-    probs = model(X)                        # shape (1, pad_to, V)
-    pred_ids = probs.argmax(axis=-1)[0]     # shape (pad_to,)
+    feed = (ids + [pad] * model.T)[: model.T]
+    logits = model.forward(np.array([feed], dtype=np.int32))[0]   # (T,V)
+    preds  = logits.argmax(-1)                                    # (T,)
 
-    # 4) decode the entire predicted sequence (skipping specials & pads)
-    return tok.decode(pred_ids, skip_special=True)
+    specials = {
+        tok.token2id[tok.start_token],    
+        tok.token2id[tok.pad_token],
+        tok.token2id[tok.end_token],
+        tok.token2id[tok.unk_token],
+    }
+
+    # strip leading specials,  keepreading until first PAD / END
+    answer_ids = [i for i in preds if i not in specials]
+
+    ids   = tok.encode("17+8=")[:-1]
+    feed  = (ids + [tok.token2id[tok.pad_token]]*model.T)[:model.T]
+    preds = model.forward(np.array([feed]))[0].argmax(-1)
+    print([tok.id2token[i] for i in preds[:10]])
+
+    return tok.decode(answer_ids, skip_special=True)
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model",  default="model.pkl",
-                   help="Pickled MiniTransformer instance")
-    p.add_argument("--prompt", required=True,
-                   help="Math question, e.g. 'What is 3 + 5?'")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model",  default="tiny_transformer.pkl")
+    ap.add_argument("--prompt", required=True)
+    args = ap.parse_args()
 
-    # 1) Load your trained model
     with open(args.model, "rb") as f:
         model = pickle.load(f)
 
-    # 2) Rebuild the tokenizer exactly as in training
-    ds = MathDataset(pad_to=model.T)
-    tok = ds.tok
-
-    # 3) Generate & print
-    answer = generate(args.prompt, model, tok, pad_to=ds.pad_to)
-    print(f"{args.prompt} → {answer}")
+    tok = MathDataset(pad_to=model.T).tok
+    print(f"{args.prompt} → {generate(args.prompt, model, tok)}")
 
 if __name__ == "__main__":
     main()
